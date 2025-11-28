@@ -1,0 +1,295 @@
+## inputs
+account_id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+custom_waf_rule_defaults = {
+enabled = true
+description = "Auto-managed WAF rule"
+}
+
+custom_waf_rulesets = {
+# This runs first because of low priority numbers
+"block_critical" = [
+{
+action = "block"
+expression = "cf.threat_score 80"
+priority = 1 # Highest priority
+},
+{
+action = "block"
+expression = "ip.geoip.country in {\"XX\"}"
+priority = 5
+}
+]
+
+# These use auto-assigned priority: 10, 20, 30...
+"admin_protection" = [
+{
+action = "managed_challenge"
+expression = "http.request.uri.path matches \"^/admin\""
+}
+]
+
+# This runs later
+"log_everything" = [
+{
+action = "log"
+expression = "true"
+priority = 999 # Runs last
+}
+]
+}
+
+
+## code
+provider "cloudflare" {}
+
+# ==================================================================
+# Input Variables
+# ==================================================================
+
+variable "account_id" {
+description = "Cloudflare account ID"
+type = string
+}
+
+variable "enforce_unique_priority" {
+description = "Set to true to FAIL on duplicate manual priorities instead of auto-fixing them"
+type = bool
+default = false
+}
+
+variable "custom_waf_rule_defaults" {
+description = "Defaults merged into every rule"
+type = object({
+enabled = optional(bool, true)
+description = optional(string, "Managed by Terraform")
+})
+default = {
+enabled = true
+description = "Managed by Terraform"
+}
+}
+
+variable "custom_waf_rulesets" {
+description = "Map of custom ruleset name → list of rules"
+type = map(list(object({
+action = string
+expression = string
+description = optional(string)
+enabled = optional(bool)
+priority = optional(number) # If omitted → auto 10,20,30…
+})))
+default = {}
+}
+
+# ==================================================================
+# AUTO-GENERATE UNIQUE PRIORITIES + stable refs
+# ==================================================================
+
+locals {
+defaults = var.custom_waf_rule_defaults
+
+# ── Detect duplicate manual priorities (only used when enforce_unique_priority = true) ──
+user_priorities = {
+for rs_name, rules in var.custom_waf_rulesets : rs_name =[
+for r in rules : r.priority if r.priority != null
+]
+}
+
+has_duplicate_manual = anytrue([
+for priors in values(local.user_priorities) : length(priors) != length(toset(priors))
+])
+
+dynamic "null_resource" "enforce_priority_uniqueness" {
+for_each = var.enforce_unique_priority && local.has_duplicate_manual ? [1] : []
+content {
+triggers = { always = timestamp() }
+precondition {
+condition = false
+error_message = "Duplicate manual priorities detected. Set enforce_unique_priority = false to auto-fix, or make them unique."
+}
+}
+}
+
+# ── Final rules with guaranteed-unique priorities ──
+custom_rules_final = {
+for rs_name, input_rules in var.custom_waf_rulesets : rs_name =[
+for idx, rule in input_rules : merge(local.defaults, rule, {
+ref = "`\({rs_name}_rule_\)`{idx + 1}"
+
+# Smart priority:
+# • Keep user value if set
+# • If duplicate → bump by +1, +2, etc.
+# • If omitted → 10,20,30…
+priority = rule.priority != null ? (
+rule.priority + length([
+for i in range(idx) : input_rules[i].priority
+if input_rules[i].priority == rule.priority
+])
+) : (idx + 1) * 10
+})
+]
+}
+
+# Root execute rules (run very early)
+root_execute_rules = {
+for idx, rs_name in keys(var.custom_waf_rulesets) : rs_name =[
+{
+action = "execute"
+expression = "true"
+description = "Execute custom ruleset: ${rs_name}"
+enabled = true
+ref = "${rs_name}_root_execute"
+priority = (idx + 1) * 5
+action_parameters = { id = cloudflare_ruleset.custom_waf_rulesets[rs_name].id }
+logging = null
+ratelimit = null
+}
+]
+}
+}
+
+# ==================================================================
+# Resources
+# ==================================================================
+
+resource "cloudflare_ruleset" "custom_waf_rulesets" {
+for_each = var.custom_waf_rulesets
+
+account_id = var.account_id
+name = each.key
+description = "Custom WAF ruleset — ${each.key}"
+kind = "custom"
+phase = "http_request_firewall_custom"
+
+rules = local.custom_rules_final[each.key]
+}
+
+resource "cloudflare_ruleset" "account_root_rulesets" {
+for_each = var.custom_waf_rulesets
+
+account_id = var.account_id
+name = "WAF Root — ${each.key}"
+description = "Root entry point executing only: ${each.key}"
+kind = "root"
+phase = "http_request_firewall_custom"
+
+rules = local.root_execute_rules[each.key]
+}
+
+# ==================================================================
+# Outputs
+# ==================================================================
+
+output "custom_rulesets" {
+value = { for k, v in cloudflare_ruleset.custom_waf_rulesets : k ={
+id = v.id
+rules = [for r in v.rules : "${r.priority} | ${r.ref} | ${r.action} | ${r.expression}"]
+}}
+}
+
+output "root_rulesets" {
+value = { for k, v in cloudflare_ruleset.account_root_rulesets : k =v.id }
+}
+
+
+## terraform plan
+Terraform used the selected providers to generate the following execution plan. Resource actions are indicated with the following symbols:
++ create
+
+Terraform will perform the following actions:
+
+# cloudflare_ruleset.custom_waf_rulesets["admin_protection"] will be created
++ resource "cloudflare_ruleset" "custom_waf_rulesets" {
++ account_id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
++ description = "Custom WAF ruleset — admin_protection"
++ id = (known after apply)
++ kind = "custom"
++ name = "admin_protection"
++ phase = "http_request_firewall_custom"
++ version = (known after apply)
+
++ rules {
++ action = "managed_challenge"
++ description = "Managed by Terraform"
++ enabled = true
++ expression = "http.request.uri.path matches \"^/admin\""
++ priority = 10
++ ref = "admin_protection_rule_1"
+}
+}
+
+# cloudflare_ruleset.custom_waf_rulesets["critical"] will be created
++ resource "cloudflare_ruleset" "custom_waf_rulesets" {
++ account_id = "0a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p"
++ description = "Custom WAF ruleset — critical"
++ id = (known after apply)
++ kind = "custom"
++ name = "critical"
++ phase = "http_request_firewall_custom"
++ version = (known after apply)
+
++ rules {
++ action = "block"
++ description = "Managed by Terraform"
++ enabled = true
++ expression = "cf.threat_score 80"
++ priority = 10
++ ref = "critical_rule_1"
+}
++ rules {
++ action = "block"
++ description = "Managed by Terraform"
++ enabled = true
++ expression = "cf.threat_score 70"
++ priority = 11 # ← auto-fixed from duplicate 10
++ ref = "critical_rule_2"
+}
++ rules {
++ action = "log"
++ description = "Managed by Terraform"
++ enabled = true
++ expression = "true"
++ priority = 30 # ← auto-assigned
++ ref = "critical_rule_3"
+}
+}
+
+# cloudflare_ruleset.account_root_rulesets["admin_protection"] will be created
++ resource "cloudflare_ruleset" "account_root_rulesets" {
++ account_id = "0a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p"
++ description = "Root entry point executing only: admin_protection"
++ id = (known after apply)
++ kind = "root"
++ name = "WAF Root — admin_protection"
++ phase = "http_request_firewall_custom"
+
++ rules {
++ action = "execute"
++ description = "Execute custom ruleset: admin_protection"
++ enabled = true
++ expression = "true"
++ priority = 10
++ ref = "admin_protection_root_execute"
++ action_parameters { + id = (known after apply) }
+}
+}
+
+# cloudflare_ruleset.account_root_rulesets["critical"] will be created
++ resource "cloudflare_ruleset" "account_root_rulesets" {
++ action = "execute"
++ description = "Execute custom ruleset: critical"
++ enabled = true
++ expression = "true"
++ priority = 5
++ ref = "critical_root_execute"
++ action_parameters { + id = (known after apply) }
+}
+
+Plan: 4 to add, 0 to change, 0 to destroy.
+
+Do you want to perform these actions?
+Terraform will perform the actions described above.
+Only 'yes' will be accepted to approve.
+
+Enter a value: yes
